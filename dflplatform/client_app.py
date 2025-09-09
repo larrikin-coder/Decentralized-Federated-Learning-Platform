@@ -1,55 +1,34 @@
-"""dflplatform: A Flower / PyTorch app."""
-
+# client_app.py
+from flwr.client import ClientApp, NumPyClient
+from dflplatform.task import MRINet, train, test, get_weights, set_weights, load_data
 import torch
 
-from flwr.client import ClientApp, NumPyClient
-from flwr.common import Context
-from dflplatform.task import Net, get_weights, load_data, set_weights, test, train
 
-
-# Define Flower Client and client_fn
 class FlowerClient(NumPyClient):
-    def __init__(self, net, trainloader, valloader, local_epochs):
-        self.net = net
-        self.trainloader = trainloader
-        self.valloader = valloader
-        self.local_epochs = local_epochs
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        self.net.to(self.device)
+    def __init__(self, partition_dir):
+        self.model = MRINet()
+        self.partition_dir = partition_dir
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    def get_parameters(self, config):
+        return get_weights(self.model)
 
     def fit(self, parameters, config):
-        set_weights(self.net, parameters)
-        train_loss = train(
-            self.net,
-            self.trainloader,
-            self.local_epochs,
-            self.device,
-        )
-        return (
-            get_weights(self.net),
-            len(self.trainloader.dataset),
-            {"train_loss": train_loss},
-        )
+        set_weights(self.model, parameters)
+        trainloader, _ = load_data(self.partition_dir)
+        loss = train(self.model, trainloader, epochs=1, device=self.device)
+        return get_weights(self.model), len(trainloader.dataset), {"loss": loss}
 
     def evaluate(self, parameters, config):
-        set_weights(self.net, parameters)
-        loss, accuracy = test(self.net, self.valloader, self.device)
-        return loss, len(self.valloader.dataset), {"accuracy": accuracy}
+        set_weights(self.model, parameters)
+        _, testloader = load_data(self.partition_dir)
+        loss, accuracy = test(self.model, testloader, self.device)
+        return loss, len(testloader.dataset), {"accuracy": accuracy}
 
 
-def client_fn(context: Context):
-    # Load model and data
-    net = Net()
-    partition_id = context.node_config["partition-id"]
-    num_partitions = context.node_config["num-partitions"]
-    trainloader, valloader = load_data(partition_id, num_partitions)
-    local_epochs = context.run_config["local-epochs"]
-
-    # Return Client instance
-    return FlowerClient(net, trainloader, valloader, local_epochs).to_client()
+def client_fn(context):
+    partition_dir = context.node_config["partition_dir"]
+    return FlowerClient(partition_dir)
 
 
-# Flower ClientApp
-app = ClientApp(
-    client_fn,
-)
+app = ClientApp(client_fn=client_fn)

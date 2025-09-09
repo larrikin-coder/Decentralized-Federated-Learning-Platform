@@ -1,104 +1,119 @@
-"""dflplatform: A Flower / PyTorch app."""
-
-from collections import OrderedDict
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from flwr_datasets import FederatedDataset
-from flwr_datasets.partitioner import IidPartitioner
-from torch.utils.data import DataLoader
-from torchvision.transforms import Compose, Normalize, ToTensor
+from torch.utils.data import DataLoader, Dataset
+import nibabel as nib   # for NIfTI MRI files (.nii)
+import numpy as np
+from collections import OrderedDict
+from torchvision import transforms
 
 
-class Net(nn.Module):
-    """Model (simple CNN adapted from 'PyTorch: A 60 Minute Blitz')"""
+# -------------------------
+# 1. Define CNN for MRI slices
+# -------------------------
+class MRINet(nn.Module):
+    """Simple CNN for MRI slice classification"""
 
-    def __init__(self):
-        super(Net, self).__init__()
-        self.conv1 = nn.Conv2d(3, 6, 5)
+    def __init__(self, num_classes=2):
+        super(MRINet, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
-        self.conv2 = nn.Conv2d(6, 16, 5)
-        self.fc1 = nn.Linear(16 * 5 * 5, 120)
-        self.fc2 = nn.Linear(120, 84)
-        self.fc3 = nn.Linear(84, 10)
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        self.fc1 = nn.Linear(64 * 64 * 64, 128)  # assuming 128x128 slices
+        self.fc2 = nn.Linear(128, num_classes)
 
     def forward(self, x):
         x = self.pool(F.relu(self.conv1(x)))
         x = self.pool(F.relu(self.conv2(x)))
-        x = x.view(-1, 16 * 5 * 5)
+        x = x.view(x.size(0), -1)
         x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        return self.fc2(x)
 
 
-fds = None  # Cache FederatedDataset
+# -------------------------
+# 2. MRI Dataset Loader
+# -------------------------
+class MRIDataset(Dataset):
+    def __init__(self, data_dir, transform=None):
+        self.files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith(".nii")]
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.files)
+
+    def __getitem__(self, idx):
+        img_path = self.files[idx]
+        img_obj = nib.load(img_path)
+        img_data = img_obj.get_fdata()
+
+        # take middle slice
+        slice_ = img_data[:, :, img_data.shape[2] // 2]
+        slice_ = np.array(slice_, dtype=np.float32)
+
+        # normalize
+        slice_ = (slice_ - np.min(slice_)) / (np.max(slice_) - np.min(slice_))
+        slice_ = np.expand_dims(slice_, axis=0)  # add channel dimension (1, H, W)
+
+        label = 0 if "healthy" in img_path else 1  # simple binary classification
+
+        if self.transform:
+            slice_ = self.transform(slice_)
+
+        return torch.tensor(slice_), torch.tensor(label, dtype=torch.long)
 
 
-def load_data(partition_id: int, num_partitions: int):
-    """Load partition CIFAR10 data."""
-    # Only initialize `FederatedDataset` once
-    global fds
-    if fds is None:
-        partitioner = IidPartitioner(num_partitions=num_partitions)
-        fds = FederatedDataset(
-            dataset="uoft-cs/cifar10",
-            partitioners={"train": partitioner},
-        )
-    partition = fds.load_partition(partition_id)
-    # Divide data on each node: 80% train, 20% test
-    partition_train_test = partition.train_test_split(test_size=0.2, seed=42)
-    pytorch_transforms = Compose(
-        [ToTensor(), Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    )
+# -------------------------
+# 3. Data Loaders
+# -------------------------
+def load_data(partition_dir):
+    transform = transforms.Compose([])
+    dataset = MRIDataset(partition_dir, transform=transform)
 
-    def apply_transforms(batch):
-        """Apply transforms to the partition from FederatedDataset."""
-        batch["img"] = [pytorch_transforms(img) for img in batch["img"]]
-        return batch
+    # Split into train/test
+    train_size = int(0.8 * len(dataset))
+    test_size = len(dataset) - train_size
+    train_ds, test_ds = torch.utils.data.random_split(dataset, [train_size, test_size])
 
-    partition_train_test = partition_train_test.with_transform(apply_transforms)
-    trainloader = DataLoader(partition_train_test["train"], batch_size=32, shuffle=True)
-    testloader = DataLoader(partition_train_test["test"], batch_size=32)
+    trainloader = DataLoader(train_ds, batch_size=8, shuffle=True)
+    testloader = DataLoader(test_ds, batch_size=8)
+
     return trainloader, testloader
 
 
+# -------------------------
+# 4. Train/Test helpers
+# -------------------------
 def train(net, trainloader, epochs, device):
-    """Train the model on the training set."""
-    net.to(device)  # move model to GPU if available
-    criterion = torch.nn.CrossEntropyLoss().to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+    net.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.001)
     net.train()
-    running_loss = 0.0
     for _ in range(epochs):
-        for batch in trainloader:
-            images = batch["img"]
-            labels = batch["label"]
+        for images, labels in trainloader:
+            images, labels = images.to(device), labels.to(device)
             optimizer.zero_grad()
-            loss = criterion(net(images.to(device)), labels.to(device))
+            outputs = net(images)
+            loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-            running_loss += loss.item()
-
-    avg_trainloss = running_loss / len(trainloader)
-    return avg_trainloss
+    return loss.item()
 
 
 def test(net, testloader, device):
-    """Validate the model on the test set."""
     net.to(device)
-    criterion = torch.nn.CrossEntropyLoss()
-    correct, loss = 0, 0.0
+    criterion = nn.CrossEntropyLoss()
+    loss, correct, total = 0, 0, 0
+    net.eval()
     with torch.no_grad():
-        for batch in testloader:
-            images = batch["img"].to(device)
-            labels = batch["label"].to(device)
+        for images, labels in testloader:
+            images, labels = images.to(device), labels.to(device)
             outputs = net(images)
             loss += criterion(outputs, labels).item()
-            correct += (torch.max(outputs.data, 1)[1] == labels).sum().item()
-    accuracy = correct / len(testloader.dataset)
-    loss = loss / len(testloader)
-    return loss, accuracy
+            _, predicted = torch.max(outputs, 1)
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+    return loss / len(testloader), correct / total
 
 
 def get_weights(net):
