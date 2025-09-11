@@ -8,6 +8,8 @@ import numpy as np
 from collections import OrderedDict
 from torchvision import transforms
 import pandas as pd
+import torch.optim as optim
+
 
 # class MRINet(nn.Module):
 #     """Simple CNN for MRI slice classification"""
@@ -93,7 +95,16 @@ def train_model(model, trainloader, instructions: dict, device):
             loss = criterion(outputs, y_batch)
             loss.backward()
             optimizer.step()
-    return loss.item()
+    total_loss = 0
+    count = 0
+    for _ in range(epochs):
+        for x_batch, y_batch in trainloader:
+            ...
+            total_loss += loss.item()
+            count += 1
+    return total_loss / count
+
+    # return loss.item()
 
 def test_model(model, testloader, device):
     model.to(device)

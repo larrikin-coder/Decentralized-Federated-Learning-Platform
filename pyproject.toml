@@ -53,8 +53,18 @@ training_instructions = {epochs=5, lr=0.005, optimizer_type="Adam", optimizer_pa
 [tool.flwr.federations]
 default = "local-simulation"
 
+
+#multiprocessing federation
+[tool.flwr.federations.multiprocessing_simulation]
+backend = "multiprocessing"
+options.num-supernodes = 1
+options.num-clients-per-supernode = 2
+
+
+
 # Local simulation federation with 10 virtual SuperNodes
 [tool.flwr.federations.local-simulation]
+backend = "multiprocessing"
 options.num-supernodes = 1
 options.num-clients-per-supernode = 2 
 
